@@ -45,18 +45,10 @@ Export the model in both FP32 and INT4 formats using [optimum-intel](https://git
 pip install optimum-intel[openvino] nncf
 
 # Export FP32
-optimum-cli export openvino \
-    --model google/embedding-gemma-300m \
-    --weight-format fp32 \
-    --task feature-extraction \
-    embeddinggemma-ov-optimum/fp32
+optimum-cli export openvino --model google/embeddinggemma-300m --task feature-extraction --weight-format fp32 --trust-remote-code embeddinggemma-ov-optimum\fp32
 
 # Export INT4 (NNCF quantization)
-optimum-cli export openvino \
-    --model google/embedding-gemma-300m \
-    --weight-format int4 \
-    --task feature-extraction \
-    embedding-gemma-int4-ov
+optimum-cli export openvino --model google/embeddinggemma-300m --task feature-extraction --weight-format int4 --trust-remote-code embedding-gemma-int4-ov
 ```
 
 Each exported directory should contain:
