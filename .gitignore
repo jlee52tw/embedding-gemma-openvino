@@ -1,0 +1,42 @@
+# Build directories
+build/
+out/
+
+# Visual Studio
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.user
+*.suo
+*.ncb
+*.opensdf
+*.sdf
+.vs/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+_deps/
+
+# Compiled binaries
+*.exe
+*.dll
+*.pdb
+*.lib
+*.obj
+*.o
+*.a
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
