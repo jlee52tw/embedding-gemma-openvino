@@ -1,15 +1,17 @@
 # EmbeddingGemma OpenVINO Benchmark
 
-C++ benchmark for **Google's EmbeddingGemma-300m** embedding model using OpenVINO™ 2026.0. Compares **INT4 vs FP32** precision on **CPU and GPU**, measuring performance (TTFT, TPOT, latency percentiles) and accuracy (Recall@1, cosine similarity).
+C++ and Python benchmarks for **Google's EmbeddingGemma-300m** embedding model using OpenVINO™ 2026.0. Compares **INT4 vs INT8 vs FP32** precision on **CPU and GPU**, measuring performance (latency) and accuracy (Recall@1, cosine similarity).
 
 ## Features
 
-- **Raw OpenVINO C++ API benchmark** (`embedding_gemma_benchmark`) — handles `position_ids` manually for full model compatibility
+- **Python benchmark** (`embedding_gemma_benchmark.py`) — recommended, supports INT4/INT8/FP32 with GPU reshape optimization
+- **C++ benchmark** (`embedding_gemma_benchmark`) — raw OpenVINO C++ API, handles `position_ids` manually
 - **GenAI TextEmbeddingPipeline test** (`genai_embedding_test`) — uses the high-level `ov::genai::TextEmbeddingPipeline` API
+- **GPU reshape optimization** — fully static `[1, N]` reshape for INT4/INT8 on GPU eliminates kernel recompilation
 - **10 built-in test scenarios** covering astronomy, history, CS, biology, geography, physics, music, medicine, technology, and environment
 - **External TSV dataset support** — load custom retrieval datasets (STS-B included)
 - **Automated Recall@1** accuracy metric with per-scenario reporting
-- **INT4-vs-FP32 cosine similarity** comparison to quantify quantization accuracy loss
+- **Cross-precision cosine similarity** comparison (INT4/INT8 vs FP32 baseline)
 
 ## Prerequisites
 
@@ -38,7 +40,7 @@ Or install standalone: [CMake 3.15+](https://cmake.org/download/) and [MSVC Buil
 
 ### 3. EmbeddingGemma-300m Models
 
-Export the model in both FP32 and INT4 formats using [optimum-intel](https://github.com/huggingface/optimum-intel):
+Export the model in FP32, INT8, and INT4 formats using [optimum-intel](https://github.com/huggingface/optimum-intel):
 
 ```bash
 # Install dependencies
@@ -47,9 +49,20 @@ pip install optimum-intel[openvino] nncf
 # Export FP32
 optimum-cli export openvino --model google/embeddinggemma-300m --task feature-extraction --weight-format fp32 --trust-remote-code embeddinggemma-ov-optimum\fp32
 
+# Export INT8
+optimum-cli export openvino --model google/embeddinggemma-300m --task feature-extraction --weight-format int8 --trust-remote-code embeddinggemma-ov-optimum\int8
+
 # Export INT4 (NNCF quantization)
-optimum-cli export openvino --model google/embeddinggemma-300m --task feature-extraction --weight-format int4 --trust-remote-code embedding-gemma-int4-ov
+optimum-cli export openvino --model google/embeddinggemma-300m --task feature-extraction --weight-format int4 --trust-remote-code embeddinggemma-ov-optimum\int4
 ```
+
+**Model sizes:**
+
+| Precision | Size |
+|-----------|------|
+| FP32 | 1,155 MB |
+| INT8 | 290 MB |
+| INT4 | 244 MB |
 
 Each exported directory should contain:
 ```
@@ -93,7 +106,59 @@ This produces two executables in `build/Release/`:
 
 ## Run
 
-### Raw OV API Benchmark (recommended)
+### Python Benchmark (recommended)
+
+```powershell
+# Set up OpenVINO environment
+& "C:\path\to\openvino_genai_windows_2026.0.0.0_x86_64\setupvars.ps1"
+
+# Basic usage — all precisions, all devices
+python embedding_gemma_benchmark.py `
+    "C:\path\to\embeddinggemma-ov-optimum\int4" `
+    "C:\path\to\embeddinggemma-ov-optimum\fp32"
+
+# With INT8 model
+python embedding_gemma_benchmark.py `
+    "C:\path\to\embeddinggemma-ov-optimum\int4" `
+    "C:\path\to\embeddinggemma-ov-optimum\fp32" `
+    --int8-dir "C:\path\to\embeddinggemma-ov-optimum\int8"
+
+# GPU only, all precisions
+python embedding_gemma_benchmark.py `
+    "C:\path\to\embeddinggemma-ov-optimum\int4" `
+    "C:\path\to\embeddinggemma-ov-optimum\fp32" `
+    --int8-dir "C:\path\to\embeddinggemma-ov-optimum\int8" `
+    --device GPU
+
+# GPU only, single precision, custom iterations
+python embedding_gemma_benchmark.py `
+    "C:\path\to\embeddinggemma-ov-optimum\int4" `
+    "C:\path\to\embeddinggemma-ov-optimum\fp32" `
+    --int8-dir "C:\path\to\embeddinggemma-ov-optimum\int8" `
+    --precision INT8 --device GPU --warmup 2 --iters 30
+
+# With external TSV dataset and custom seq-len
+python embedding_gemma_benchmark.py `
+    "C:\path\to\embeddinggemma-ov-optimum\int4" `
+    "C:\path\to\embeddinggemma-ov-optimum\fp32" `
+    --dataset stsb_retrieval.tsv --seq-len 512
+```
+
+**Python CLI Arguments:**
+
+| Argument | Description | Default |
+|----------|-------------|----------|
+| `int4_dir` | Path to INT4 model directory | (required) |
+| `fp32_dir` | Path to FP32 model directory | (required) |
+| `--int8-dir` | Path to INT8 model directory | (optional) |
+| `--device` | Device: `CPU`, `GPU`, or `ALL` | `ALL` |
+| `--precision` | Precision: `INT4`, `INT8`, `FP32`, or `ALL` | `ALL` |
+| `--warmup` | Warmup iterations | `3` |
+| `--iters` | Benchmark iterations | `10` |
+| `--seq-len` | Fixed sequence length for GPU reshape | `256` |
+| `--dataset` | External TSV dataset file | built-in |
+
+### C++ Benchmark
 
 ```powershell
 # Basic usage with built-in 10 scenarios
@@ -157,56 +222,46 @@ What is the capital of France?	1	Berlin is the capital of Germany.	Paris is the 
 | Component | Version |
 |-----------|---------|
 | CPU | Intel® Core™ Ultra (Series 2) |
-| GPU | Intel® Arc™ integrated |
+| GPU | Intel® Arc™ B580 |
 | OS | Windows 11 |
 | OpenVINO | 2026.0.0 |
-| MSVC | 19.44 |
 | Model | EmbeddingGemma-300m (768-dim, 24 layers) |
 
-### Built-in 10 Scenarios (2 warmup, 2 iterations)
+### GPU Benchmark (Python, 30 iterations, 10 built-in scenarios)
 
 ```
+python embedding_gemma_benchmark.py int4 fp32 --int8-dir int8 --device GPU --warmup 2 --iters 30
+
 ================================================================
   Performance & Accuracy Summary
 ================================================================
-Config            TTFT(ms)    TPOT(ms)    p50(ms)     p99(ms)     Recall@1
---------------------------------------------------------------------------------
-FP32 / CPU        16.98       43.93       36.58       90.60       10/10 (100%)
-INT4 / CPU        12.25       27.74       23.93       53.56       10/10 (100%)
-FP32 / GPU        14.60       20.04       18.22       63.09       10/10 (100%)
-INT4 / GPU        19.25       28.84       24.54       112.02      10/10 (100%)
---------------------------------------------------------------------------------
+Config              Avg(ms)     Min(ms)     Max(ms)     Iters   Recall@1
+------------------------------------------------------------------------------
+FP32 / GPU          17.31       13.83       73.01       600     10/10 (100%)
+INT8 / GPU          6.99        6.57        20.00       1500    10/10 (100%)
+INT4 / GPU          6.74        6.37        8.21        1500    10/10 (100%)
+------------------------------------------------------------------------------
 ```
 
-### STS-B Retrieval Dataset (50 scenarios, 3 iterations)
+> INT4/INT8 on GPU use fully static reshape `[1, 256]` by default. Each text is embedded individually (batch=1), matching real RAG pipeline usage. This eliminates GPU kernel recompilation and yields **2.5x speedup** over FP32.
 
-```
-================================================================
-  Performance & Accuracy Summary
-================================================================
-Config            TTFT(ms)    TPOT(ms)    p50(ms)     p99(ms)     Recall@1
---------------------------------------------------------------------------------
-FP32 / CPU        15.65       41.36       30.12       83.32       19/20 (95%)
-INT4 / CPU        11.16       25.99       20.20       51.95       19/20 (95%)
-FP32 / GPU        14.33       17.51       16.65       39.09       19/20 (95%)
-INT4 / GPU        18.71       53.97       23.18       557.05      19/20 (95%)
---------------------------------------------------------------------------------
-```
+### INT4/INT8 vs FP32 Accuracy (Cosine Similarity)
 
-### INT4 vs FP32 Accuracy (Cosine Similarity)
+| Precision | Mean Query Cosine Sim | Mean Doc Cosine Sim |
+|-----------|----------------------|---------------------|
+| INT8 | 0.9998 | 0.9997 |
+| INT4 | 0.9870 | 0.9844 |
 
-| Device | Mean Query Cosine Sim | Mean Doc Cosine Sim |
-|--------|----------------------|---------------------|
-| CPU | 0.9875 | 0.9850 |
-| GPU | 0.9875 | 0.9843 |
-
-> INT4 quantization preserves **>98.4% embedding fidelity** compared to FP32, with **zero Recall@1 degradation** on the built-in test set.
+> INT8 quantization preserves **>99.97% embedding fidelity** with 4x size reduction (1155MB → 290MB).
+> INT4 quantization preserves **>98.4% embedding fidelity** with 4.7x size reduction (1155MB → 244MB).
+> **All configurations achieve 100% Recall@1** on the built-in test set.
 
 ### Key Findings
 
-- **INT4 CPU is ~1.6x faster** than FP32 CPU (TPOT 28ms vs 44ms) with no accuracy loss
-- **FP32 GPU is the fastest** overall (TPOT 20ms)
-- **INT4 quantization** shows negligible accuracy degradation (cosine sim >0.98)
+- **INT4 GPU is the fastest** overall (6.74ms avg) — 2.6x faster than FP32 GPU
+- **INT8 GPU is nearly as fast** (6.99ms avg) with near-lossless accuracy (cosine sim >0.999)
+- **INT8 is the best accuracy/size tradeoff** — 4x smaller than FP32 with negligible quality loss
+- **GPU reshape `[1, N]`** is critical for quantized models on GPU (eliminates kernel recompilation)
 - **All configurations achieve 100% Recall@1** on the 10 built-in scenarios
 
 ## Architecture Notes
@@ -216,6 +271,19 @@ INT4 / GPU        18.71       53.97       23.18       557.05      19/20 (95%)
 EmbeddingGemma uses a `Gemma3TextModel` architecture with **bidirectional attention** and requires `position_ids` as a model input. The GenAI `TextEmbeddingPipeline` ([source](https://github.com/openvinotoolkit/openvino.genai/blob/master/src/cpp/src/rag/text_embedding_pipeline.cpp)) sets `input_ids` and `attention_mask` but does **not** set `position_ids`, causing a MatMul shape mismatch error at inference time.
 
 The `TextRerankPipeline` in the same codebase correctly handles `position_ids` — this is a known gap in the GenAI SDK.
+
+### GPU Reshape Optimization
+
+Quantized models (INT4/INT8) on GPU suffer from **kernel recompilation** when input tensor shapes change between inference calls. This is because quantized graphs have ~40% more operations (dequantization nodes), and each new shape triggers OpenCL/L0 kernel rebuilds.
+
+The benchmark uses `model.reshape({...: [1, seq_len]})` to set a **fully static shape** (batch=1, fixed sequence length) for all model inputs. This:
+- Eliminates **all** kernel recompilation — kernels compile once and are reused
+- Uses **batch=1** which matches real RAG usage (documents indexed one-at-a-time, queries embedded individually)
+- Pads/truncates all inputs to the fixed `--seq-len` (default: 256 tokens)
+
+The `--seq-len` parameter can be tuned: use `64` for short queries, `256` for typical RAG chunks, `512` for longer documents (max: 2048 per model's `max_position_embeddings`).
+
+FP32 on GPU does **not** use reshape because it has fewer ops and handles dynamic shapes more efficiently.
 
 ### Embedding Pipeline
 

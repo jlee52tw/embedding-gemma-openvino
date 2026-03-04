@@ -26,16 +26,23 @@ import openvino as ov
 import openvino_genai as ov_genai
 
 
+# ──────────────── GPU optimization config ────────────────
+
+@dataclass
+class GpuOptConfig:
+    """GPU optimization parameters (all disabled by default)."""
+    static_seq_len: int = 0        # >0 → model.reshape with fixed seq_len
+    batch_one: bool = False        # True → fully static [1, seq_len] (RAG-style)
+    label_suffix: str = ""         # appended to config label
+
+
 # ──────────────────────── helpers ────────────────────────
 
 @dataclass
 class TimingStats:
-    first_latency_ms: float = 0.0   # TTFT  - first call latency
-    mean_latency_ms: float = 0.0    # TPOT  - average per-call latency
+    avg_latency_ms: float = 0.0
     min_latency_ms: float = 0.0
     max_latency_ms: float = 0.0
-    p50_latency_ms: float = 0.0
-    p99_latency_ms: float = 0.0
     iterations: int = 0
 
 
@@ -100,15 +107,37 @@ def embed_texts(
     tokenizer: ov_genai.Tokenizer,
     model_has_position_ids: bool,
     texts: List[str],
+    pad_to: int = 0,
 ) -> np.ndarray:
-    """Run inference on a list of texts and return pooled+normalized embeddings."""
+    """Run inference on a list of texts and return pooled+normalized embeddings.
+
+    Args:
+        pad_to: If >0, right-pad input_ids / attention_mask / position_ids
+                to this fixed sequence length (avoids GPU kernel recompilation).
+    """
     encoded = tokenizer.encode(texts)
 
     input_ids = encoded.input_ids.data
     attention_mask = encoded.attention_mask.data
 
-    request.set_tensor("input_ids", encoded.input_ids)
-    request.set_tensor("attention_mask", encoded.attention_mask)
+    if pad_to > 0:
+        batch, seq_len = input_ids.shape
+        target_len = pad_to
+        if seq_len < target_len:
+            pad_width = target_len - seq_len
+            input_ids = np.pad(input_ids, ((0, 0), (0, pad_width)),
+                               mode="constant", constant_values=0)
+            attention_mask = np.pad(attention_mask, ((0, 0), (0, pad_width)),
+                                    mode="constant", constant_values=0)
+        elif seq_len > target_len:
+            # Truncate to fixed length (needed for static reshape)
+            input_ids = input_ids[:, :target_len]
+            attention_mask = attention_mask[:, :target_len]
+        request.set_tensor("input_ids", ov.Tensor(input_ids))
+        request.set_tensor("attention_mask", ov.Tensor(attention_mask))
+    else:
+        request.set_tensor("input_ids", encoded.input_ids)
+        request.set_tensor("attention_mask", encoded.attention_mask)
 
     if model_has_position_ids:
         batch, seq_len = input_ids.shape
@@ -294,15 +323,34 @@ def run_all_scenarios(
     scenarios: List[TestScenario],
     warmup_iters: int,
     bench_iters: int,
+    gpu_opt: Optional[GpuOptConfig] = None,
 ) -> ConfigResult:
     cr = ConfigResult(total_scenarios=len(scenarios))
+    opt = gpu_opt or GpuOptConfig()
+    # When static_seq_len is set, pad/truncate inputs to match the fixed shape
+    pad_to = opt.static_seq_len
 
-    print(f"  Loading model from: {model_dir} on {device} ...", end="", flush=True)
+    opt_desc = ""
+    if opt.static_seq_len > 0:
+        batch_dim = 1 if opt.batch_one else -1
+        opt_desc += f" reshape=[{batch_dim},{opt.static_seq_len}]"
+    print(f"  Loading model from: {model_dir} on {device}{opt_desc} ...", end="", flush=True)
     t0 = time.perf_counter()
 
     core = ov.Core()
     model = core.read_model(os.path.join(model_dir, "openvino_model.xml"))
+
+    # --- GPU optimization: static reshape ---
+    if opt.static_seq_len > 0:
+        batch_dim = 1 if opt.batch_one else -1
+        shapes = {}
+        for inp in model.inputs:
+            name = next(iter(inp.get_names()))
+            shapes[name] = [batch_dim, opt.static_seq_len]
+        model.reshape(shapes)
+
     compiled = core.compile_model(model, device)
+
     request = compiled.create_infer_request()
     tokenizer = ov_genai.Tokenizer(model_dir)
     model_has_pos_ids = has_input(compiled, "position_ids")
@@ -314,12 +362,15 @@ def run_all_scenarios(
     wq = query_prompt + scenarios[0].query
     wd = [doc_prompt + d for d in scenarios[0].documents]
     for _ in range(warmup_iters):
-        embed_texts(request, tokenizer, model_has_pos_ids, [wq])
-        embed_texts(request, tokenizer, model_has_pos_ids, wd)
+        embed_texts(request, tokenizer, model_has_pos_ids, [wq], pad_to=pad_to)
+        if opt.batch_one:
+            for d_text in wd:
+                embed_texts(request, tokenizer, model_has_pos_ids, [d_text], pad_to=pad_to)
+        else:
+            embed_texts(request, tokenizer, model_has_pos_ids, wd, pad_to=pad_to)
 
     # Benchmark
     all_latencies: List[float] = []
-    first_latency = 0.0
     last_iter_results: List[ScenarioResult] = []
 
     for iteration in range(bench_iters):
@@ -329,16 +380,25 @@ def run_all_scenarios(
             pd = [doc_prompt + d for d in sc.documents]
 
             qs = time.perf_counter()
-            q_emb = embed_texts(request, tokenizer, model_has_pos_ids, [pq])
+            q_emb = embed_texts(request, tokenizer, model_has_pos_ids, [pq], pad_to=pad_to)
             qe = time.perf_counter()
             all_latencies.append((qe - qs) * 1000)
-            if iteration == 0 and si == 0:
-                first_latency = all_latencies[-1]
 
-            ds = time.perf_counter()
-            d_emb = embed_texts(request, tokenizer, model_has_pos_ids, pd)
-            de = time.perf_counter()
-            all_latencies.append((de - ds) * 1000)
+            if opt.batch_one:
+                # Embed each doc individually (fully static shape, RAG-style)
+                doc_embs = []
+                for d_text in pd:
+                    ds = time.perf_counter()
+                    one_emb = embed_texts(request, tokenizer, model_has_pos_ids, [d_text], pad_to=pad_to)
+                    de = time.perf_counter()
+                    all_latencies.append((de - ds) * 1000)
+                    doc_embs.append(one_emb[0])
+                d_emb = np.stack(doc_embs)
+            else:
+                ds = time.perf_counter()
+                d_emb = embed_texts(request, tokenizer, model_has_pos_ids, pd, pad_to=pad_to)
+                de = time.perf_counter()
+                all_latencies.append((de - ds) * 1000)
 
             # Score documents
             scores = [cosine_similarity(q_emb[0], d_emb[di]) for di in range(len(d_emb))]
@@ -365,14 +425,10 @@ def run_all_scenarios(
 
     # Compute stats
     lat = np.array(all_latencies)
-    lat_sorted = np.sort(lat)
     cr.stats = TimingStats(
-        first_latency_ms=first_latency,
-        mean_latency_ms=float(lat.mean()),
-        min_latency_ms=float(lat_sorted[0]),
-        max_latency_ms=float(lat_sorted[-1]),
-        p50_latency_ms=percentile(lat_sorted, 50.0),
-        p99_latency_ms=percentile(lat_sorted, 99.0),
+        avg_latency_ms=float(lat.mean()),
+        min_latency_ms=float(lat.min()),
+        max_latency_ms=float(lat.max()),
         iterations=len(all_latencies),
     )
     cr.success = True
@@ -383,13 +439,10 @@ def run_all_scenarios(
 
 def print_stats(label: str, s: TimingStats) -> None:
     print(f"\n  -- {label} --")
-    print(f"  Iterations : {s.iterations}")
-    print(f"  TTFT       : {s.first_latency_ms:.2f} ms")
-    print(f"  TPOT (avg) : {s.mean_latency_ms:.2f} ms")
-    print(f"  Latency min: {s.min_latency_ms:.2f} ms")
-    print(f"  Latency max: {s.max_latency_ms:.2f} ms")
-    print(f"  Latency p50: {s.p50_latency_ms:.2f} ms")
-    print(f"  Latency p99: {s.p99_latency_ms:.2f} ms")
+    print(f"  Iterations  : {s.iterations}")
+    print(f"  Avg latency : {s.avg_latency_ms:.2f} ms")
+    print(f"  Min latency : {s.min_latency_ms:.2f} ms")
+    print(f"  Max latency : {s.max_latency_ms:.2f} ms")
 
 
 # ──────────────── main ────────────────
@@ -401,15 +454,34 @@ def main() -> int:
         epilog="""\
 Examples:
   python embedding_gemma_benchmark.py models/int4 models/fp32
+  python embedding_gemma_benchmark.py models/int4 models/fp32 --int8-dir models/int8
   python embedding_gemma_benchmark.py models/int4 models/fp32 --warmup 3 --iters 10
   python embedding_gemma_benchmark.py models/int4 models/fp32 --dataset test_dataset.tsv
+  python embedding_gemma_benchmark.py models/int4 models/fp32 --seq-len 512
+  python embedding_gemma_benchmark.py models/int4 models/fp32 --device GPU
+  python embedding_gemma_benchmark.py models/int4 models/fp32 --precision INT8 --device GPU
 """,
     )
     parser.add_argument("int4_dir", help="Path to INT4 model directory")
     parser.add_argument("fp32_dir", help="Path to FP32 model directory")
+    parser.add_argument("--int8-dir", type=str, default="", help="Path to INT8 model directory (optional)")
     parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations (default: 3)")
     parser.add_argument("--iters", type=int, default=10, help="Benchmark iterations (default: 10)")
     parser.add_argument("--dataset", type=str, default="", help="TSV dataset file (optional)")
+    parser.add_argument(
+        "--device", type=str, default="ALL", choices=["CPU", "GPU", "ALL"],
+        help="Device to run on: CPU, GPU, or ALL (default: ALL)",
+    )
+    parser.add_argument(
+        "--precision", type=str, default="ALL", choices=["INT4", "INT8", "FP32", "ALL"],
+        help="Model precision to test: INT4, INT8, FP32, or ALL (default: ALL)",
+    )
+    parser.add_argument(
+        "--seq-len", type=int, default=256,
+        help="Fixed sequence length for INT4/INT8 GPU reshape (default: 256, max: 2048). "
+             "Inputs are padded/truncated to this length. Use 64 for short queries, "
+             "256 for typical RAG chunks, 512 for longer documents.",
+    )
     args = parser.parse_args()
 
     # SentenceTransformer-style prompts for EmbeddingGemma
@@ -428,85 +500,110 @@ Examples:
     print("  EmbeddingGemma-300m Benchmark  (raw OV Python API)")
     print("=" * 64)
     print(f"  INT4 model  : {args.int4_dir}")
+    if args.int8_dir:
+        print(f"  INT8 model  : {args.int8_dir}")
     print(f"  FP32 model  : {args.fp32_dir}")
     print(f"  Warmup      : {args.warmup} iterations")
     print(f"  Benchmark   : {args.iters} iterations")
     print(f"  Scenarios   : {len(scenarios)}")
     print(f"  Dataset     : {dataset_source}")
+    print(f"  Device      : {args.device}")
+    print(f"  Precision   : {args.precision}")
+    print(f"  Seq length  : {args.seq_len} (INT4/INT8 GPU reshape=[1,N])")
     print("=" * 64)
 
-    devices = ["CPU", "GPU"]
+    devices = ["CPU", "GPU"] if args.device == "ALL" else [args.device]
+    precisions = [("FP32", args.fp32_dir), ("INT4", args.int4_dir)]
+    if args.int8_dir:
+        precisions.insert(1, ("INT8", args.int8_dir))
+    if args.precision != "ALL":
+        precisions = [(p, d) for p, d in precisions if p == args.precision]
     all_results: List[ConfigResult] = []
 
+    # Build list of (label, model_dir, device, gpu_opt) configs to run
+    configs: List[Tuple[str, str, str, Optional[GpuOptConfig]]] = []
     for device in devices:
-        for precision, model_dir in [("FP32", args.fp32_dir), ("INT4", args.int4_dir)]:
-            label = f"{precision} / {device}"
-            print(f"\n{'=' * 64}")
-            print(f"  Testing: {label}  ({len(scenarios)} scenarios x {args.iters} iters)")
-            print("=" * 64)
+        for precision, model_dir in precisions:
+            # For INT4/INT8 on GPU, use static reshape to avoid kernel recompilation
+            gpu_opt = None
+            if precision in ("INT4", "INT8") and device == "GPU":
+                gpu_opt = GpuOptConfig(static_seq_len=args.seq_len, batch_one=True)
+            configs.append((f"{precision} / {device}", model_dir, device, gpu_opt))
 
-            cr = ConfigResult(label=label)
-            try:
-                cr = run_all_scenarios(
-                    model_dir, device, query_prompt, doc_prompt,
-                    scenarios, args.warmup, args.iters,
+    for label, model_dir, device, gpu_opt in configs:
+        print(f"\n{'=' * 64}")
+        print(f"  Testing: {label}  ({len(scenarios)} scenarios x {args.iters} iters)")
+        print("=" * 64)
+
+        cr = ConfigResult(label=label)
+        try:
+            cr = run_all_scenarios(
+                model_dir, device, query_prompt, doc_prompt,
+                scenarios, args.warmup, args.iters,
+                gpu_opt=gpu_opt,
+            )
+            cr.label = label
+
+            print_stats(label, cr.stats)
+
+            # Per-scenario ranking results
+            print(f"\n  -- Recall@1: {label} --")
+            for si, (sc, sr) in enumerate(zip(scenarios, cr.scenario_results)):
+                status = "OK" if sr.correct else "MISS"
+                q_short = sc.query[:50]
+                print(
+                    f"  [{si:2d}] {status:>4s}  predicted={sr.predicted_top_idx}"
+                    f" expected={sc.expected_top_idx}"
+                    f"  score={sr.top_score:.4f}"
+                    f'  Q: "{q_short}"'
                 )
-                cr.label = label
+            pct = 100.0 * cr.correct_count / cr.total_scenarios if cr.total_scenarios else 0.0
+            print(f"  Recall@1 = {cr.correct_count} / {cr.total_scenarios} ({pct:.1f}%)")
 
-                print_stats(label, cr.stats)
+        except Exception as ex:
+            print(f"  [SKIP] {label}: {ex}")
 
-                # Per-scenario ranking results
-                print(f"\n  -- Recall@1: {label} --")
-                for si, (sc, sr) in enumerate(zip(scenarios, cr.scenario_results)):
-                    status = "OK" if sr.correct else "MISS"
-                    q_short = sc.query[:50]
-                    print(
-                        f"  [{si:2d}] {status:>4s}  predicted={sr.predicted_top_idx}"
-                        f" expected={sc.expected_top_idx}"
-                        f"  score={sr.top_score:.4f}"
-                        f'  Q: "{q_short}"'
-                    )
-                pct = 100.0 * cr.correct_count / cr.total_scenarios if cr.total_scenarios else 0.0
-                print(f"  Recall@1 = {cr.correct_count} / {cr.total_scenarios} ({pct:.1f}%)")
-
-            except Exception as ex:
-                print(f"  [SKIP] {label}: {ex}")
-
-            all_results.append(cr)
+        all_results.append(cr)
 
     # -- Cross-precision accuracy comparison --
+    # Compare every non-FP32 config against the FP32 baseline on the same device
     print(f"\n{'=' * 64}")
-    print("  Embedding Accuracy: INT4 vs FP32  (per-scenario cosine sim)")
+    print("  Embedding Accuracy vs FP32 Baseline  (per-scenario cosine sim)")
     print("=" * 64)
 
-    for device in devices:
-        fp32_cr: Optional[ConfigResult] = None
-        int4_cr: Optional[ConfigResult] = None
-        for cr in all_results:
-            if cr.label == f"FP32 / {device}" and cr.success:
-                fp32_cr = cr
-            if cr.label == f"INT4 / {device}" and cr.success:
-                int4_cr = cr
-        if not fp32_cr or not int4_cr:
+    # Find FP32 baselines
+    fp32_baselines = {}
+    for cr in all_results:
+        for dev in devices:
+            if cr.label == f"FP32 / {dev}" and cr.success:
+                fp32_baselines[dev] = cr
+
+    for cr in all_results:
+        if not cr.success or cr.label.startswith("FP32"):
+            continue
+        # Determine device for this config
+        ref_dev = "GPU" if "GPU" in cr.label else "CPU"
+        fp32_cr = fp32_baselines.get(ref_dev)
+        if not fp32_cr:
             continue
 
-        print(f"\n  -- INT4 vs FP32 on {device} --")
+        print(f"\n  -- {cr.label} vs FP32/{ref_dev} --")
         sum_q_cos = 0.0
         sum_d_cos = 0.0
-        n_scenarios = min(len(fp32_cr.scenario_results), len(int4_cr.scenario_results))
+        n_scenarios = min(len(fp32_cr.scenario_results), len(cr.scenario_results))
         for si in range(n_scenarios):
             fp32_sr = fp32_cr.scenario_results[si]
-            int4_sr = int4_cr.scenario_results[si]
+            opt_sr = cr.scenario_results[si]
 
-            q_cos = cosine_similarity(fp32_sr.embeddings.query_embedding, int4_sr.embeddings.query_embedding)
+            q_cos = cosine_similarity(fp32_sr.embeddings.query_embedding, opt_sr.embeddings.query_embedding)
             sum_q_cos += q_cos
 
-            nd = min(len(fp32_sr.embeddings.doc_embeddings), len(int4_sr.embeddings.doc_embeddings))
+            nd = min(len(fp32_sr.embeddings.doc_embeddings), len(opt_sr.embeddings.doc_embeddings))
             scenario_doc_cos = 0.0
             for di in range(nd):
                 scenario_doc_cos += cosine_similarity(
                     fp32_sr.embeddings.doc_embeddings[di],
-                    int4_sr.embeddings.doc_embeddings[di],
+                    opt_sr.embeddings.doc_embeddings[di],
                 )
             if nd > 0:
                 scenario_doc_cos /= nd
@@ -522,24 +619,25 @@ Examples:
     print(f"\n{'=' * 64}")
     print("  Performance & Accuracy Summary")
     print("=" * 64)
+    col_w = 20
     print(
-        f"{'Config':<18s}{'TTFT(ms)':<12s}{'TPOT(ms)':<12s}"
-        f"{'p50(ms)':<12s}{'p99(ms)':<12s}{'Recall@1':<14s}"
+        f"{'Config':<{col_w}s}{'Avg(ms)':<12s}{'Min(ms)':<12s}"
+        f"{'Max(ms)':<12s}{'Iters':<8s}{'Recall@1':<14s}"
     )
-    print("-" * 80)
+    print("-" * (col_w + 58))
 
     for cr in all_results:
         if not cr.success:
-            print(f"{cr.label:<18s}  SKIPPED")
+            print(f"{cr.label:<{col_w}s}  SKIPPED")
             continue
         pct = 100.0 * cr.correct_count / cr.total_scenarios if cr.total_scenarios else 0.0
         recall_str = f"{cr.correct_count}/{cr.total_scenarios} ({pct:.0f}%)"
         print(
-            f"{cr.label:<18s}{cr.stats.first_latency_ms:<12.2f}{cr.stats.mean_latency_ms:<12.2f}"
-            f"{cr.stats.p50_latency_ms:<12.2f}{cr.stats.p99_latency_ms:<12.2f}{recall_str:<14s}"
+            f"{cr.label:<{col_w}s}{cr.stats.avg_latency_ms:<12.2f}{cr.stats.min_latency_ms:<12.2f}"
+            f"{cr.stats.max_latency_ms:<12.2f}{cr.stats.iterations:<8d}{recall_str:<14s}"
         )
 
-    print("-" * 80)
+    print("-" * (col_w + 58))
     print("\nDone.")
     return 0
 
